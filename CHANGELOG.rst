@@ -17,6 +17,10 @@ Unreleased
 0.1.71 – 2026-09-17
 *******************
 
+* feat: Add a standalone SAML 2.0 XML-DSig assertion generator
+  (``channel_integrations.sap_success_factors.saml.generate_saml_assertion``) for SAP
+  SuccessFactors OAuth assertion-based authentication.
+
 * feat: extend ``SAPSuccessFactorsEnterpriseCustomerConfiguration`` with an ``auth_type`` field
   (``sap_signed_assertion`` / ``self_signed_assertion``, defaulting to ``sap_signed_assertion``),
   encrypted-at-rest ``private_key`` and ``private_key_passphrase`` fields used to self-sign SAML
