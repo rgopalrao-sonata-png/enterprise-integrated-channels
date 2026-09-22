@@ -662,8 +662,12 @@ class TestSAPSuccessFactorsAPIClientSAMLBearerAuth(unittest.TestCase):
         token_calls = [
             call for call in responses.calls if call.request.url == self.url_base + self.oauth_token_api_path
         ]
+        completion_calls = [
+            call for call in responses.calls
+            if call.request.url == self.url_base + self.completion_status_api_path
+        ]
         assert len(token_calls) == 1
-        assert len(responses.calls) == 3
+        assert len(completion_calls) == 2
 
     @responses.activate
     def test_user_token_cache_refetches_after_expiry(self):
@@ -689,3 +693,251 @@ class TestSAPSuccessFactorsAPIClientSAMLBearerAuth(unittest.TestCase):
             call for call in responses.calls if call.request.url == self.url_base + self.oauth_token_api_path
         ]
         assert len(token_calls) == 2
+
+    @responses.activate
+    def test_user_token_cache_invalidated_on_auth_rejection(self):
+        """
+        A token SAP rejects must not be reused for the rest of the run. Without eviction the
+        first 401 would poison every later record for the same learner.
+        """
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_token_api_path,
+            json=self.expected_token_response_body,
+            status=200
+        )
+        responses.add(
+            responses.POST,
+            self.url_base + self.completion_status_api_path,
+            json={"error": "invalid_token"},
+            status=401
+        )
+
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        with raises(ClientError):
+            sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+
+        # The rejected token is gone, so the next record re-acquires rather than reusing it.
+        assert self.learner_user_id not in sap_client._user_token_cache  # pylint: disable=protected-access
+
+        with raises(ClientError):
+            sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+
+        token_calls = [
+            call for call in responses.calls if call.request.url == self.url_base + self.oauth_token_api_path
+        ]
+        assert len(token_calls) == 2
+
+    @responses.activate
+    def test_user_token_cache_retained_on_non_auth_error(self):
+        """
+        A 500 from SAP says nothing about the token's validity, so it should stay cached.
+        """
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_token_api_path,
+            json=self.expected_token_response_body,
+            status=200
+        )
+        responses.add(
+            responses.POST,
+            self.url_base + self.completion_status_api_path,
+            json={"error": "boom"},
+            status=500
+        )
+
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        with raises(ClientError):
+            sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+
+        assert self.learner_user_id in sap_client._user_token_cache  # pylint: disable=protected-access
+
+        with raises(ClientError):
+            sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+
+        token_calls = [
+            call for call in responses.calls if call.request.url == self.url_base + self.oauth_token_api_path
+        ]
+        assert len(token_calls) == 1
+
+    @responses.activate
+    def test_expired_user_tokens_are_evicted_from_cache(self):
+        """
+        The cache must not accumulate one entry per learner for the whole of a sync run.
+        """
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_token_api_path,
+            json={"expires_in": 0, "access_token": self.access_token},
+            status=200
+        )
+        responses.add(
+            responses.POST,
+            self.url_base + self.completion_status_api_path,
+            json={"success": "true"},
+            status=200
+        )
+
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        sap_client.create_course_completion('learner_one', json.dumps(self.completion_payload))
+        sap_client.create_course_completion('learner_two', json.dumps(self.completion_payload))
+
+        # learner_one's token expired immediately, so it is dropped rather than retained
+        # alongside learner_two's.
+        assert 'learner_one' not in sap_client._user_token_cache  # pylint: disable=protected-access
+
+    @responses.activate
+    def test_prevent_self_submit_grades_uses_saml_bearer_session(self):
+        """
+        The ``prevent_self_submit_grades`` branch of ``create_course_completion`` posts with the
+        shared session, which must also resolve to the SAML bearer path in self-signed mode.
+        """
+        self.enterprise_config.prevent_self_submit_grades = True
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_token_api_path,
+            json=self.expected_token_response_body,
+            status=200
+        )
+        responses.add(
+            responses.POST,
+            self.url_base + SAPSuccessFactorsAPIClient.GENERIC_COURSE_COMPLETION_PATH,
+            json={"success": "true"},
+            status=200
+        )
+
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        with patch.object(
+            sap_client, 'get_oauth_access_token', wraps=sap_client.get_oauth_access_token,
+        ) as legacy_spy:
+            sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+
+        legacy_spy.assert_not_called()
+        token_calls = [
+            call for call in responses.calls if call.request.url == self.url_base + self.oauth_token_api_path
+        ]
+        assert len(token_calls) == 1
+
+
+@mark.django_db
+class TestSAPSuccessFactorsAPIClientLegacyAuthRegression(unittest.TestCase):
+    """
+    Regression cover for ``SAPAuthType.SAP_SIGNED_ASSERTION`` (legacy) customers after the
+    ENT-12305 auth_type branching: the SAML bearer path must stay entirely out of their way at
+    BOTH auth call sites, mirroring
+    ``TestSAPSuccessFactorsAPIClientSAMLBearerAuth.test_both_auth_call_sites_honour_auth_type``.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.oauth_api_path = "learning/oauth-api/rest/v1/token"
+        self.oauth_token_api_path = "oauth/token"
+        self.completion_status_api_path = "learning/odatav4/public/admin/ocn/v1/current-user/item/learning-event"
+        self.course_api_path = "learning/odatav4/public/admin/ocn/v1/OcnCourses"
+        self.url_base = "http://test.successfactors.com/"
+        self.client_id = "client_id"
+        self.client_secret = "client_secret"
+        self.company_id = "company_id"
+        self.user_id = "admin_user_id"
+        self.learner_user_id = "learner_user_id"
+        self.expires_in = 1800
+        self.access_token = "legacy_access_token"
+
+        SAPSuccessFactorsGlobalConfiguration.objects.create(
+            completion_status_api_path=self.completion_status_api_path,
+            course_api_path=self.course_api_path,
+            oauth_api_path=self.oauth_api_path,
+            oauth_token_api_path=self.oauth_token_api_path,
+        )
+
+        self.expected_token_response_body = {"expires_in": self.expires_in, "access_token": self.access_token}
+        self.enterprise_config = SAPSuccessFactorsEnterpriseCustomerConfiguration(
+            encrypted_key=self.client_id,
+            sapsf_base_url=self.url_base,
+            sapsf_company_id=self.company_id,
+            sapsf_user_id=self.user_id,
+            encrypted_secret=self.client_secret,
+            auth_type=SAPAuthType.SAP_SIGNED_ASSERTION,
+        )
+        self.enterprise_config.enterprise_customer = EnterpriseCustomerFactory()
+        self.completion_payload = {
+            "userID": "abc123",
+            "courseID": "course-v1:ColumbiaX+DS101X+1T2016",
+            "providerID": "EDX",
+            "courseCompleted": "true",
+            "completedTimestamp": 1485283526,
+            "instructorName": "Professor Professorson",
+            "grade": "Pass"
+        }
+
+    def test_config_defaults_to_legacy_auth(self):
+        """
+        Existing customers must stay on the SAP-signed path until explicitly migrated.
+        """
+        assert not self.enterprise_config.uses_self_signed_assertion
+        assert SAPSuccessFactorsEnterpriseCustomerConfiguration().auth_type == SAPAuthType.SAP_SIGNED_ASSERTION
+
+    @responses.activate
+    def test_both_auth_call_sites_stay_on_legacy_path(self):
+        """
+        Mirror of the self-signed test: for a legacy customer neither ``_create_session`` nor the
+        per-user override path may reach ``get_saml_bearer_access_token``.
+        """
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_api_path,
+            json=self.expected_token_response_body,
+            status=200
+        )
+        responses.add(
+            responses.POST,
+            self.url_base + self.completion_status_api_path,
+            json={"success": "true"},
+            status=200
+        )
+
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        with patch.object(
+            sap_client, 'get_saml_bearer_access_token', wraps=sap_client.get_saml_bearer_access_token,
+        ) as saml_bearer_spy, patch.object(
+            sap_client, 'get_oauth_access_token', wraps=sap_client.get_oauth_access_token,
+        ) as legacy_spy:
+            sap_client._create_session()  # pylint: disable=protected-access
+            sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+
+        saml_bearer_spy.assert_not_called()
+        assert legacy_spy.call_count == 2
+
+        # Nothing was ever posted to the modern token endpoint.
+        modern_token_calls = [
+            call for call in responses.calls if call.request.url == self.url_base + self.oauth_token_api_path
+        ]
+        assert not modern_token_calls
+
+    @responses.activate
+    def test_legacy_user_override_token_is_cached(self):
+        """
+        ENT-12305 added caching to the override path for legacy customers too -- previously it
+        acquired a fresh token per learner record.
+        """
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_api_path,
+            json=self.expected_token_response_body,
+            status=200
+        )
+        responses.add(
+            responses.POST,
+            self.url_base + self.completion_status_api_path,
+            json={"success": "true"},
+            status=200
+        )
+
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+        sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+
+        token_calls = [
+            call for call in responses.calls if call.request.url == self.url_base + self.oauth_api_path
+        ]
+        assert len(token_calls) == 1

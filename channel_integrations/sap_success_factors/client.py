@@ -55,8 +55,9 @@ class SAPSuccessFactorsAPIClient(IntegratedChannelApiClient):  # pylint: disable
         self.session = None
         self.expires_at = None
         # Per-user bearer tokens acquired by ``_call_post_with_user_override``, keyed by SAP user
-        # id. Unlike ``self.session``, this call site is hit once per learner record, so a shared
-        # session cache would not help -- each user needs (and reuses) its own token.
+        # id, as ``{sap_user_id: (token, expires_at)}``. Unlike ``self.session``, this call site is
+        # hit once per learner record, so a shared session cache would not help -- each user needs
+        # (and reuses) its own token. Entries are dropped once expired, and on a 401/403 from SAP.
         self._user_token_cache = {}
         self.IntegratedChannelAPIRequestLogs = apps.get_model(
             "channel_integration", "IntegratedChannelAPIRequestLogs"
@@ -151,7 +152,6 @@ class SAPSuccessFactorsAPIClient(IntegratedChannelApiClient):  # pylint: disable
             ClientError: If the assertion could not be built/signed, we received a failure
                 response code from SAP SuccessFactors, or the response was of an unexpected format.
         """
-        customer_uuid = self.enterprise_configuration.enterprise_customer.uuid
         token_url = urljoin(
             self.enterprise_configuration.sapsf_base_url,
             self.global_sap_config.oauth_token_api_path,
@@ -170,7 +170,7 @@ class SAPSuccessFactorsAPIClient(IntegratedChannelApiClient):  # pylint: disable
             LOGGER.error(
                 generate_formatted_log(
                     'SAP',
-                    customer_uuid,
+                    self.enterprise_configuration.enterprise_customer.uuid,
                     None,
                     None,
                     f"Unable to build SAML bearer assertion for user {str(user_id)}: {str(error)}"
@@ -185,7 +185,7 @@ class SAPSuccessFactorsAPIClient(IntegratedChannelApiClient):  # pylint: disable
             'grant_type': 'urn:ietf:params:oauth:grant-type:saml2-bearer',
             'assertion': base64.b64encode(assertion.encode('utf-8')).decode('utf-8'),
         }
-        response = requests.post(token_url, data=serialized_data)
+        response = requests.post(token_url, data=serialized_data, timeout=self.SESSION_TIMEOUT)
         duration_seconds = time.time() - start_time
         # The assertion is redacted before it reaches the (unencrypted) API record table -- it is
         # a signed attestation of the user's identity, not something that belongs in plaintext
@@ -208,7 +208,7 @@ class SAPSuccessFactorsAPIClient(IntegratedChannelApiClient):  # pylint: disable
             LOGGER.error(
                 generate_formatted_log(
                     'SAP',
-                    customer_uuid,
+                    self.enterprise_configuration.enterprise_customer.uuid,
                     None,
                     None,
                     f"SAP SF SAML bearer POST response is of invalid format. User: {str(user_id)}, "
@@ -381,6 +381,29 @@ class SAPSuccessFactorsAPIClient(IntegratedChannelApiClient):  # pylint: disable
 
         return response_status_code, response_body
 
+    def _evict_expired_user_tokens(self, now):
+        """
+        Drop every per-user token that has already expired.
+
+        Args:
+            now (datetime.datetime): Naive UTC timestamp to compare expiries against.
+        """
+        expired = [
+            user_id for user_id, (_, expires_at) in self._user_token_cache.items()
+            if now >= expires_at
+        ]
+        for user_id in expired:
+            del self._user_token_cache[user_id]
+
+    def _invalidate_user_token(self, sap_user_id):
+        """
+        Forget the cached token for a user so the next call acquires a fresh one.
+
+        Args:
+            sap_user_id (str): The user whose cached token should be discarded.
+        """
+        self._user_token_cache.pop(sap_user_id, None)
+
     def _get_access_token_for_user(self, sap_user_id):
         """
         Return a bearer token for a specific SAP user, honouring ``auth_type`` and reusing a
@@ -399,6 +422,11 @@ class SAPSuccessFactorsAPIClient(IntegratedChannelApiClient):  # pylint: disable
             cached_token, cached_expires_at = cached
             if now < cached_expires_at:
                 return cached_token
+
+        # A sync run walks every learner once, so without this the cache would grow one entry
+        # per learner and hold them for the whole run. Dropping expired entries on each miss
+        # bounds it to the learners seen within a single token lifetime.
+        self._evict_expired_user_tokens(now)
 
         if self.enterprise_configuration.uses_self_signed_assertion:
             oauth_access_token, expires_at = self.get_saml_bearer_access_token(sap_user_id)
@@ -452,6 +480,14 @@ class SAPSuccessFactorsAPIClient(IntegratedChannelApiClient):  # pylint: disable
         )
 
         if response.status_code >= 400:
+            # SAP rejected the credential we had cached as still-valid (early revocation, clock
+            # skew, a user/company mismatch). Without evicting it here every remaining record
+            # for this learner would reuse the same rejected token until its nominal expiry.
+            if response.status_code in (
+                HTTPStatus.UNAUTHORIZED.value,
+                HTTPStatus.FORBIDDEN.value,
+            ):
+                self._invalidate_user_token(sap_user_id)
             raise ClientError(
                 'SAPSuccessFactorsAPIClient request failed with status {status_code}: {message}'.format(
                     status_code=response.status_code,
