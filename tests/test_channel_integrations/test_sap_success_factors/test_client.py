@@ -2,28 +2,44 @@
 Tests for the SAPSF API Client.
 """
 
+import base64
 import datetime
 import json
 import unittest
-from unittest.mock import MagicMock
-from urllib.parse import urljoin
+from unittest.mock import MagicMock, patch
+from urllib.parse import parse_qs, urljoin
 
 import ddt
 import pytest
 import requests
 import responses
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from freezegun import freeze_time
 from pytest import mark, raises
 
 from channel_integrations.exceptions import ClientError
 from channel_integrations.sap_success_factors.client import SAPSuccessFactorsAPIClient
 from channel_integrations.sap_success_factors.models import (
+    SAPAuthType,
     SAPSuccessFactorsEnterpriseCustomerConfiguration,
     SAPSuccessFactorsGlobalConfiguration,
 )
 from test_utils.factories import EnterpriseCustomerFactory
 
 NOW = datetime.datetime(2017, 1, 2, 3, 4, 5)
+
+
+def _generate_rsa_private_key_pem():
+    """
+    Return a throwaway, test-only RSA private key PEM string.
+    """
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode('utf-8')
 
 
 @ddt.ddt
@@ -36,6 +52,7 @@ class TestSAPSuccessFactorsAPIClient(unittest.TestCase):
     def setUp(self):
         super().setUp()
         self.oauth_api_path = "learning/oauth-api/rest/v1/token"
+        self.oauth_token_api_path = "oauth/token"
         self.completion_status_api_path = "learning/odatav4/public/admin/ocn/v1/current-user/item/learning-event"
         self.course_api_path = "learning/odatav4/public/admin/ocn/v1/OcnCourses"
         self.url_base = "http://test.successfactors.com/"
@@ -65,7 +82,8 @@ class TestSAPSuccessFactorsAPIClient(unittest.TestCase):
         SAPSuccessFactorsGlobalConfiguration.objects.create(
             completion_status_api_path=self.completion_status_api_path,
             course_api_path=self.course_api_path,
-            oauth_api_path=self.oauth_api_path
+            oauth_api_path=self.oauth_api_path,
+            oauth_token_api_path=self.oauth_token_api_path,
         )
 
         self.expected_token_response_body = {"expires_in": self.expires_in, "access_token": self.access_token}
@@ -462,3 +480,212 @@ class TestSAPSuccessFactorsAPIClient(unittest.TestCase):
         assert status == 200
         assert json.loads(body) == self.content_payload
         assert len(responses.calls) == 3
+
+
+@mark.django_db
+class TestSAPSuccessFactorsAPIClientSAMLBearerAuth(unittest.TestCase):
+    """
+    Tests for the SAML bearer (``SAPAuthType.SELF_SIGNED_ASSERTION``) auth path added by
+    ENT-12305, and for the ``auth_type`` branching in ``_create_session`` and
+    ``_call_post_with_user_override``.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.oauth_token_api_path = "oauth/token"
+        self.completion_status_api_path = "learning/odatav4/public/admin/ocn/v1/current-user/item/learning-event"
+        self.course_api_path = "learning/odatav4/public/admin/ocn/v1/OcnCourses"
+        self.url_base = "http://test.successfactors.com/"
+        self.client_id = "client_id"
+        self.company_id = "company_id"
+        self.user_id = "admin_user_id"
+        self.learner_user_id = "learner_user_id"
+        self.audience = "www.successfactors.com"
+        self.expires_in = 1800
+        self.access_token = "saml_access_token"
+        self.private_key_pem = _generate_rsa_private_key_pem()
+
+        SAPSuccessFactorsGlobalConfiguration.objects.create(
+            completion_status_api_path=self.completion_status_api_path,
+            course_api_path=self.course_api_path,
+            oauth_api_path="learning/oauth-api/rest/v1/token",
+            oauth_token_api_path=self.oauth_token_api_path,
+        )
+
+        self.expected_token_response_body = {"expires_in": self.expires_in, "access_token": self.access_token}
+        self.enterprise_config = SAPSuccessFactorsEnterpriseCustomerConfiguration(
+            encrypted_key=self.client_id,
+            sapsf_base_url=self.url_base,
+            sapsf_company_id=self.company_id,
+            sapsf_user_id=self.user_id,
+            auth_type=SAPAuthType.SELF_SIGNED_ASSERTION,
+            encrypted_private_key=self.private_key_pem,
+            saml_assertion_audience=self.audience,
+        )
+        self.enterprise_config.enterprise_customer = EnterpriseCustomerFactory()
+        self.completion_payload = {
+            "userID": "abc123",
+            "courseID": "course-v1:ColumbiaX+DS101X+1T2016",
+            "providerID": "EDX",
+            "courseCompleted": "true",
+            "completedTimestamp": 1485283526,
+            "instructorName": "Professor Professorson",
+            "grade": "Pass"
+        }
+
+    @responses.activate
+    @freeze_time(NOW)
+    def test_get_saml_bearer_access_token_success(self):
+        expected_response = (self.access_token, NOW + datetime.timedelta(seconds=self.expires_in))
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_token_api_path,
+            json=self.expected_token_response_body,
+            status=200
+        )
+
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        actual_response = sap_client.get_saml_bearer_access_token(self.learner_user_id)
+
+        assert actual_response == expected_response
+        assert len(responses.calls) == 1
+        request_body = parse_qs(responses.calls[0].request.body)
+        assert request_body['grant_type'] == ['urn:ietf:params:oauth:grant-type:saml2-bearer']
+        assert request_body['client_id'] == [self.client_id]
+        assert request_body['company_id'] == [self.company_id]
+        assertion_xml = base64.b64decode(request_body['assertion'][0]).decode('utf-8')
+        assert self.learner_user_id in assertion_xml
+        assert self.audience in assertion_xml
+
+    @responses.activate
+    def test_get_saml_bearer_access_token_response_missing_fields(self):
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_token_api_path,
+            json={"error": "invalid_request"},
+            status=200
+        )
+        with raises(ClientError):
+            SAPSuccessFactorsAPIClient(self.enterprise_config).get_saml_bearer_access_token(self.learner_user_id)
+
+    def test_get_saml_bearer_access_token_malformed_key_raises_client_error(self):
+        self.enterprise_config.decrypted_private_key = 'not-a-valid-pem-key'
+        with raises(ClientError):
+            SAPSuccessFactorsAPIClient(self.enterprise_config).get_saml_bearer_access_token(self.learner_user_id)
+
+    @responses.activate
+    def test_create_session_uses_saml_bearer_for_self_signed_assertion(self):
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_token_api_path,
+            json=self.expected_token_response_body,
+            status=200
+        )
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        sap_client._create_session()  # pylint: disable=protected-access
+
+        assert len(responses.calls) == 1
+        assert responses.calls[0].request.url == self.url_base + self.oauth_token_api_path
+        assert sap_client.session.headers['Authorization'] == 'Bearer {}'.format(self.access_token)
+
+    @responses.activate
+    def test_call_post_with_user_override_uses_saml_bearer_for_self_signed_assertion(self):
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_token_api_path,
+            json=self.expected_token_response_body,
+            status=200
+        )
+        responses.add(
+            responses.POST,
+            self.url_base + self.completion_status_api_path,
+            json={"success": "true"},
+            status=200
+        )
+
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+
+        assert len(responses.calls) == 2
+        assert responses.calls[0].request.url == self.url_base + self.oauth_token_api_path
+
+    @responses.activate
+    def test_both_auth_call_sites_honour_auth_type(self):
+        """
+        Catches the 'only _create_session() got updated' class of bug: both call sites must
+        resolve to the SAML bearer path for a self-signed-assertion customer.
+        """
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_token_api_path,
+            json=self.expected_token_response_body,
+            status=200
+        )
+        responses.add(
+            responses.POST,
+            self.url_base + self.completion_status_api_path,
+            json={"success": "true"},
+            status=200
+        )
+
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        with patch.object(
+            sap_client, 'get_saml_bearer_access_token', wraps=sap_client.get_saml_bearer_access_token,
+        ) as saml_bearer_spy, patch.object(
+            sap_client, 'get_oauth_access_token', wraps=sap_client.get_oauth_access_token,
+        ) as legacy_spy:
+            sap_client._create_session()  # pylint: disable=protected-access
+            sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+
+        assert saml_bearer_spy.call_count == 2
+        legacy_spy.assert_not_called()
+
+    @responses.activate
+    def test_user_token_cache_reused_across_calls_for_same_user(self):
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_token_api_path,
+            json=self.expected_token_response_body,
+            status=200
+        )
+        responses.add(
+            responses.POST,
+            self.url_base + self.completion_status_api_path,
+            json={"success": "true"},
+            status=200
+        )
+
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+        sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+
+        token_calls = [
+            call for call in responses.calls if call.request.url == self.url_base + self.oauth_token_api_path
+        ]
+        assert len(token_calls) == 1
+        assert len(responses.calls) == 3
+
+    @responses.activate
+    def test_user_token_cache_refetches_after_expiry(self):
+        expired_token_response_body = {"expires_in": 0, "access_token": self.access_token}
+        responses.add(
+            responses.POST,
+            self.url_base + self.oauth_token_api_path,
+            json=expired_token_response_body,
+            status=200
+        )
+        responses.add(
+            responses.POST,
+            self.url_base + self.completion_status_api_path,
+            json={"success": "true"},
+            status=200
+        )
+
+        sap_client = SAPSuccessFactorsAPIClient(self.enterprise_config)
+        sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+        sap_client.create_course_completion(self.learner_user_id, json.dumps(self.completion_payload))
+
+        token_calls = [
+            call for call in responses.calls if call.request.url == self.url_base + self.oauth_token_api_path
+        ]
+        assert len(token_calls) == 2
