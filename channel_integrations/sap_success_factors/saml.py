@@ -176,6 +176,8 @@ def generate_saml_assertion(
             method=signxml.methods.enveloped,
             signature_algorithm='rsa-sha256',
             digest_algorithm='sha256',
+            # SAP rejects signxml's default (Canonical XML 1.1); it requires Exclusive C14N.
+            c14n_algorithm=signxml.CanonicalizationMethod.EXCLUSIVE_XML_CANONICALIZATION_1_0,
         )
         signed_assertion = signer.sign(
             assertion,
