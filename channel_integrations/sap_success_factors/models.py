@@ -201,9 +201,10 @@ class SAPSuccessFactorsEnterpriseCustomerConfiguration(EnterpriseCustomerPluginC
         help_text=_(
             "How access tokens are obtained for this customer. 'SAP-signed' asks SAP's OAuth IdP API to "
             "mint the SAML assertion for us, authenticated with the OAuth client id/secret below; "
-            "'Self-signed' signs the assertion ourselves with the configured private key instead. "
-            "Existing customers stay on 'SAP-signed' until they have been migrated. Self-signed support "
-            "is still under development and is not yet used to authenticate any transmissions."
+            "'Self-signed' means we sign the assertion ourselves with the configured private key "
+            "instead. Existing customers stay on 'SAP-signed' until they have been migrated. "
+            "Self-signed support is still under development and is not yet used to authenticate any "
+            "transmissions."
         )
     )
 
